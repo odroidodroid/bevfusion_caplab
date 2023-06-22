@@ -6,7 +6,6 @@ FUSIONMODELS = Registry("fusion_models")
 VTRANSFORMS = Registry("vtransforms")
 FUSERS = Registry("fusers")
 
-
 def build_backbone(cfg):
     return BACKBONES.build(cfg)
 
@@ -36,6 +35,6 @@ def build_fusion_model(cfg, train_cfg=None, test_cfg=None):
         cfg, default_args=dict(train_cfg=train_cfg, test_cfg=test_cfg)
     )
 
-
 def build_model(cfg, train_cfg=None, test_cfg=None):
     return build_fusion_model(cfg, train_cfg=train_cfg, test_cfg=test_cfg)
+
