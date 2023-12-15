@@ -4,7 +4,7 @@ import torch
 from mmcv.runner import auto_fp16, force_fp32
 from torch import nn
 from torch.nn import functional as F
-
+import time
 from mmdet3d.models.builder import (
     build_backbone,
     build_fuser,
@@ -101,16 +101,18 @@ class BEVFusion(Base3DFusionModel):
     ) -> torch.Tensor:
         B, N, C, H, W = x.size()
         x = x.view(B * N, C, H, W)
-
+        back_t1 = time.time()
         x = self.encoders["camera"]["backbone"](x)
+        back_t2 = time.time() - back_t1
+        neck_t1 = time.time()
         x = self.encoders["camera"]["neck"](x)
-
+        neck_t2 = time.time() - neck_t1
         if not isinstance(x, torch.Tensor):
             x = x[0]
 
         BN, C, H, W = x.size()
         x = x.view(B, int(BN / B), C, H, W)
-
+        vt_t1 = time.time()
         x = self.encoders["camera"]["vtransform"](
             x,
             points,
@@ -124,12 +126,19 @@ class BEVFusion(Base3DFusionModel):
             lidar_aug_matrix,
             img_metas,
         )
+        vt_t2 = time.time() - vt_t1
+        #print(" Time | backbone : {:.2f} | neck : {:.2f} | vtransform : {:.2f}".format(back_t2, neck_t2, vt_t2))
         return x
 
     def extract_lidar_features(self, x) -> torch.Tensor:
+        vox_t1 = time.time()
         feats, coords, sizes = self.voxelize(x)
+        vox_t2 = time.time() - vox_t1
         batch_size = coords[-1, 0] + 1
+        ext_t1 = time.time()
         x = self.encoders["lidar"]["backbone"](feats, coords, batch_size, sizes=sizes)
+        ext_t2 = time.time() - ext_t1
+        #print(" Time | voxelize : {:.2f} | extract_lidar : {:.2f}".format(vox_t2, ext_t2))
         return x
 
     @torch.no_grad()
@@ -159,7 +168,6 @@ class BEVFusion(Base3DFusionModel):
                     -1, 1
                 )
                 feats = feats.contiguous()
-
         return feats, coords, sizes
 
     @auto_fp16(apply_to=("img", "points"))
@@ -222,11 +230,13 @@ class BEVFusion(Base3DFusionModel):
         gt_labels_3d=None,
         **kwargs,
     ):
+        total_t1 = time.time()
         features = []
         for sensor in (
             self.encoders if self.training else list(self.encoders.keys())[::-1]
         ):
             if sensor == "camera":
+                cam_t1 = time.time()
                 feature = self.extract_camera_features(
                     img,
                     points,
@@ -240,8 +250,11 @@ class BEVFusion(Base3DFusionModel):
                     lidar_aug_matrix,
                     metas,
                 )
+                cam_t2 = time.time() - cam_t1
             elif sensor == "lidar":
+                lid_t1 = time.time()
                 feature = self.extract_lidar_features(points)
+                lid_t2 = time.time() - lid_t1
             else:
                 raise ValueError(f"unsupported sensor: {sensor}")
             features.append(feature)
@@ -251,16 +264,21 @@ class BEVFusion(Base3DFusionModel):
             features = features[::-1]
 
         if self.fuser is not None:
+            fuse_t1 = time.time()
             x = self.fuser(features)
+            fuse_t2 = time.time() - fuse_t1
         else:
             assert len(features) == 1, features
             x = features[0]
 
         batch_size = x.shape[0]
 
+        dec_t1 = time.time()
         x = self.decoder["backbone"](x)
+        dec_t2 = time.time() - dec_t1
+        enc_t1 = time.time()
         x = self.decoder["neck"](x)
-
+        enc_t2 = time.time() - enc_t1
         if self.training:
             outputs = {}
             for type, head in self.heads.items():
@@ -278,6 +296,7 @@ class BEVFusion(Base3DFusionModel):
                         outputs[f"stats/{type}/{name}"] = val
             return outputs
         else:
+            bbox_t1 = time.time()
             outputs = [{} for _ in range(batch_size)]
             for type, head in self.heads.items():
                 if type == "object":
@@ -302,4 +321,9 @@ class BEVFusion(Base3DFusionModel):
                         )
                 else:
                     raise ValueError(f"unsupported head: {type}")
+            bbox_t2 = time.time() - bbox_t1
+            total_t2 = time.time() - total_t1
+
+            #print(" Time | total : {:.2f} | camera : {:.2f} | lidar : {:.2f} | fuse : {:.2f} | decoder : {:.2f} | encoder : {:.2f} | bbox : {:.2f}".format(total_t2, cam_t2,lid_t2, fuse_t2, dec_t2, enc_t2, bbox_t2))
+
             return outputs

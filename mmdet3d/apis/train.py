@@ -14,7 +14,7 @@ from mmdet3d.runner import CustomEpochBasedRunner
 from mmdet3d.utils import get_root_logger
 from mmdet.core import DistEvalHook
 from mmdet.datasets import build_dataloader, build_dataset, replace_ImageToTensor
-
+from apex.contrib.sparsity import ASP
 
 def train_model(
     model,
@@ -52,8 +52,11 @@ def train_model(
         find_unused_parameters=find_unused_parameters,
     )
 
+
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
+
+    #ASP.prune_trained_model(model, optimizer)
 
     runner = build_runner(
         cfg.runner,
@@ -103,6 +106,7 @@ def train_model(
     if validate:
         # Support batch_size > 1 in validation
         val_samples_per_gpu = cfg.data.val.pop("samples_per_gpu", 1)
+        val_samples_per_gpu = 1
         if val_samples_per_gpu > 1:
             # Replace 'ImageToTensor' to 'DefaultFormatBundle'
             cfg.data.val.pipeline = replace_ImageToTensor(cfg.data.val.pipeline)
@@ -111,11 +115,12 @@ def train_model(
             val_dataset,
             samples_per_gpu=val_samples_per_gpu,
             workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
+            dist=False,
             shuffle=False,
         )
         eval_cfg = cfg.get("evaluation", {})
         eval_cfg["by_epoch"] = cfg.runner["type"] != "IterBasedRunner"
+        eval_cfg["start"] = 0
         eval_hook = DistEvalHook
         runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
 

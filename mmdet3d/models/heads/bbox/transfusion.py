@@ -303,6 +303,7 @@ class TransFusionHead(nn.Module):
 
             # Transformer Decoder Layer
             # :param query: B C Pq    :param query_pos: B Pq 3/6
+            # print("query_feat : {}, lidar_feat_flatten : {}".format(query_feat.shape, lidar_feat_flatten.shape))
             query_feat = self.decoder[i](
                 query_feat, lidar_feat_flatten, query_pos, bev_pos
             )

@@ -54,9 +54,14 @@ model:
           - [0, 0]
         block_type: basicblock
 
-lr_config: null
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 1000
+  warmup_ratio: 0.33333333
+  min_lr_ratio: 1.0e-3
 
 optimizer:
-  lr: 2.0e-4
+  lr: 2.0e-4 #2.0e-4
 
 max_epochs: 6

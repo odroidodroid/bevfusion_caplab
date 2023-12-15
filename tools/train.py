@@ -15,8 +15,12 @@ from mmdet3d.apis import train_model
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
-
-
+#from apex.contrib.sparsity import ASP
+import debugpy
+debugpy.listen(7000)
+print("Wait for debugger...")
+debugpy.wait_for_client()
+print("Debugger attached") 
 def main():
     dist.init()
 
@@ -72,13 +76,14 @@ def main():
             cfg["sync_bn"] = dict(exclude=[])
         model = convert_sync_batchnorm(model, exclude=cfg["sync_bn"]["exclude"])
 
+
     logger.info(f"Model:\n{model}")
     train_model(
         model,
         datasets,
         cfg,
         distributed=True,
-        validate=True,
+        validate=False,
         timestamp=timestamp,
     )
 

@@ -1,14 +1,202 @@
 from mmcv.cnn import ConvModule, build_conv_layer, kaiming_init
-
+from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn import Linear
 from torch.nn.init import xavier_uniform_, constant_
+from flash_attn.modules.mha import MHA
+from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func, flash_attn_qkvpacked_func, flash_attn_kvpacked_func
+__all__ = ["PositionEmbeddingLearned", "TransformerDecoderLayer", "MultiheadAttention", "FFN", "FlashAttention_qkv", "FlashAttention_kv"]
+
+def _create_cu_seqlens(batch_size: int, num_tokens: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(
+        0,
+        num_tokens * (batch_size + 1),
+        step=num_tokens,
+        dtype=torch.int32,
+        device=device,
+    )
+class FlashAttention_qkv(nn.MultiheadAttention):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert self._qkv_same_embed_dim
+        # print("--------------------FlashAttention_qkv--------------------")
+        num_tokens, batch_size, embed_dim = q.shape
+        head_dim = embed_dim // self.num_heads
+        x = torch.stack([q, k, v])
+        x = x.view(3, -1, x.shape[-1])
+        x = torch.baddbmm(self.ib(), x, self.iw())
+        qkv = x.view(3, -1, self.num_heads, head_dim).transpose(0, 1)
+        # print("qkv : {}".format(qkv.shape))
+        cu_seqlens = _create_cu_seqlens(batch_size, num_tokens, qkv.device)
+        x = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, num_tokens, dropout_p=0.1)
+        x = x.view(num_tokens, batch_size, -1)
+        # print("x : {}".format(x.shape))
+        x = F.linear(x, self.out_proj.weight, self.out_proj.bias)
+        # print("x : {}".format(x.shape))
+        return x, None
+
+    def iw(self) -> torch.Tensor:
+        tensor = self.in_proj_weight
+        tensor = tensor.view(3, -1, tensor.shape[-1])
+        tensor = tensor.transpose(1, 2).contiguous()
+        # print("qkv : inprogweight : {}".format(tensor.shape))
+        return tensor
+
+    def ib(self) -> torch.Tensor:
+        tensor = self.in_proj_bias
+        tensor = tensor.view(3, 1, -1)
+        # print("qkv : inprogbias : {}".format(tensor.shape))
+        return tensor
 
 
-__all__ = ["PositionEmbeddingLearned", "TransformerDecoderLayer", "MultiheadAttention", "FFN"]
+class FlashAttention_kv(nn.MultiheadAttention):
+    def __init__(self, embed_dim, num_heads, dropout=0.1, bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None) -> None:
+        super().__init__(embed_dim, num_heads, dropout, bias, add_bias_kv, add_zero_attn, kdim, vdim)
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim 
+        
+        self.in_proj_weight = Parameter(torch.empty(3*embed_dim, embed_dim))
+        
+        if self._qkv_same_embed_dim is False :
+            print("---------------False--------------")
+            self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
+            self.k_proj_weight = Parameter(torch.Tensor(embed_dim, self.kdim))
+            self.v_proj_weight = Parameter(torch.Tensor(embed_dim, self.vdim))
+        if bias :
+            self.in_proj_bias = Parameter(torch.empty(3*embed_dim))
+        else :
+            self.register_parameter("in_proj_bias", None)
+        self.out_proj = Linear(embed_dim, embed_dim, bias=bias)
+        
+        if add_bias_kv :
+            self.bias_k = Parameter(torch.empty(1,1,embed_dim))
+            self.bias_v = Parameter(torch.empty(1,1,embed_dim))
+        else :
+            self.bias_k = self.bias_v = None
+
+        self.add_zero_attn = add_zero_attn
+        
+        self._reset_parameters() 
+
+    def _reset_parameters(self):
+        if self._qkv_same_embed_dim:
+            xavier_uniform_(self.in_proj_weight)
+        else:
+            xavier_uniform_(self.q_proj_weight)
+            xavier_uniform_(self.k_proj_weight)
+            xavier_uniform_(self.v_proj_weight)
+
+        if self.in_proj_bias is not None:
+            constant_(self.in_proj_bias, 0.)
+            constant_(self.out_proj.bias, 0.)
+        if self.bias_k is not None:
+            xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            xavier_normal_(self.bias_v)
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        assert self._qkv_same_embed_dim is True
+        # print("--------------------FlashAttention_kv--------------------")
+        # print("q shape : {}".format(q.shape))
+        # print("k shape : {}".format(k.shape))
+        # print("v shape : {}".format(v.shape))
+        num_tokens_q, batch_size_q, embed_dim_q = q.shape
+        num_tokens_k, batch_size_k, embed_dim_kv = k.shape
+        head_dim_q = embed_dim_q // self.num_heads
+        head_dim_kv = embed_dim_kv // self.num_heads
+
+        # print("k shape : {}".format(k.shape))
+        k = k.view(1, -1, k.shape[-1])
+        k = torch.baddbmm(self.ib_k(), k, self.iw_k())
+        # print("k shape : {}".format(k.shape))
+        k = k.view(1, -1, self.num_heads, head_dim_kv).transpose(0, 1)
+        # print("k shape : {}".format(k.shape))
+        
+        # print("v shape : {}".format(v.shape))
+        v = v.view(1, -1, v.shape[-1])
+        v = torch.baddbmm(self.ib_v(), v, self.iw_v())
+        # print("v shape : {}".format(v.shape))
+        v = v.view(1, -1, self.num_heads, head_dim_kv).transpose(0, 1)
+        # print("v shape : {}".format(v.shape))
+
+        kv = torch.stack([k, v]).transpose(0,2)
+
+        # print("q shape : {}".format(q.shape))
+        q = q.view(1, -1, q.shape[-1])
+        q = torch.baddbmm(self.ib_q(), q, self.iw_q())
+        # print("q shape : {}".format(q.shape))
+        q = q.view(1, -1, self.num_heads, head_dim_q)
+        # print("q shape : {}".format(q.shape))
+
+        # cu_seqlens_q = _create_cu_seqlens(batch_size_q, num_tokens_q, q.device)
+        # cu_seqlens_k = _create_cu_seqlens(batch_size_k, num_tokens_k, k.device)
+        # print("FlashAttension_kv | q : {} kv : {}".format(q.shape, kv.shape))
+        #x = flash_attn_varlen_kvpacked_func(q=q, kv=kv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=num_tokens_q, max_seqlen_k=num_tokens_k, dropout_p=0.1)
+        x = flash_attn_kvpacked_func(q=q, kv=kv, dropout_p=0.1)
+        x = x.view(batch_size_q, num_tokens_q, -1)
+        # print("x_shape : {} out_proj_weight : {} out_proj_bias : {}".format(x.shape, self.out_proj.weight.shape, self.out_proj.bias.shape))
+        x = F.linear(x, self.out_proj.weight, self.out_proj.bias)
+        # print("x_shape : {}".format(x.shape))
+        x = x.view(num_tokens_q, batch_size_q, -1)
+        # print("x_shape : {}".format(x.shape))
+        return x, None
+
+    def iw_q(self) -> torch.Tensor:
+        tensor = self.in_proj_weight
+        tensor = tensor.view(1, -1, tensor.shape[-1])
+        tensor = tensor.transpose(1, 2).contiguous()
+        tensor = tensor[:,:,0:self.embed_dim]
+        # print("q : inprogweight : {}".format(tensor.shape))
+        return tensor
+
+    def ib_q(self) -> torch.Tensor:
+        tensor = self.in_proj_bias
+        tensor = tensor.view(1, 1, -1)
+        tensor = tensor[:,:,0:self.embed_dim]
+        # print("q : inprogbias : {}".format(tensor.shape))
+        return tensor
+
+
+    def iw_k(self) -> torch.Tensor:
+        tensor = self.in_proj_weight
+        tensor = tensor.view(1, -1, tensor.shape[-1])
+        tensor = tensor.transpose(1, 2).contiguous()
+        tensor = tensor[:,:,self.embed_dim:self.embed_dim*2]
+        # print("k : inprogweight : {}".format(tensor.shape))
+        return tensor
+
+    def ib_k(self) -> torch.Tensor:
+        tensor = self.in_proj_bias
+        tensor = tensor.view(1, 1, -1)
+        tensor = tensor[:,:,self.embed_dim:self.embed_dim*2]
+        # print("k : inprogbias : {}".format(tensor.shape))
+        return tensor
+
+    def iw_v(self) -> torch.Tensor:
+        tensor = self.in_proj_weight
+        tensor = tensor.view(1, -1, tensor.shape[-1])
+        tensor = tensor.transpose(1, 2).contiguous()
+        tensor = tensor[:,:,self.embed_dim*2:]
+        # print("v : inprogweight : {}".format(tensor.shape))
+        return tensor
+
+    def ib_v(self) -> torch.Tensor:
+        tensor = self.in_proj_bias
+        tensor = tensor.view(1, 1, -1)
+        tensor = tensor[:,:,self.embed_dim*2:]
+        # print("v : inprogbias : {}".format(tensor.shape))
+        return tensor
+
 
 
 class PositionEmbeddingLearned(nn.Module):
@@ -30,14 +218,20 @@ class PositionEmbeddingLearned(nn.Module):
         return position_embedding
 
 
+
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu",
                  self_posembed=None, cross_posembed=None, cross_only=False):
         super().__init__()
         self.cross_only = cross_only
         if not self.cross_only:
-            self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+            self.self_attn = FlashAttention_qkv(d_model, num_heads=nhead, dropout=dropout)
+            #self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+            #self.self_attn = MHA(embed_dim=d_model, num_heads=nhead, dropout=dropout, use_flash_attn=True)
+        self.multihead_attn = FlashAttention_kv(d_model, num_heads=nhead, dropout=dropout)
+        #self.multihead_attn = MultiheadAttention(d_model, num_heads=nhead, dropout=dropout)
+        #self.multihead_attn = MHA(embed_dim=d_model, num_heads=nhead, dropout=dropout, use_flash_attn=True)
+
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -92,13 +286,20 @@ class TransformerDecoderLayer(nn.Module):
 
         if not self.cross_only:
             q = k = v = self.with_pos_embed(query, query_pos_embed)
-            query2 = self.self_attn(q, k, value=v)[0]
+            #query2 = self.self_attn(q, k, value=v)[0]
+            query2 = self.self_attn(q, k, v)[0]
             query = query + self.dropout1(query2)
             query = self.norm1(query)
 
-        query2 = self.multihead_attn(query=self.with_pos_embed(query, query_pos_embed),
-                                     key=self.with_pos_embed(key, key_pos_embed),
-                                     value=self.with_pos_embed(key, key_pos_embed), attn_mask=attn_mask)[0]
+        # print("query1 : {}".format(query.shape))
+        # query2 = self.multihead_attn(query=self.with_pos_embed(query, query_pos_embed),
+        #                              key=self.with_pos_embed(key, key_pos_embed),
+        #                              value=self.with_pos_embed(key, key_pos_embed), attn_mask=attn_mask)[0]
+        query2 = self.multihead_attn(q=self.with_pos_embed(query, query_pos_embed),
+                                     k=self.with_pos_embed(key, key_pos_embed),
+                                     v=self.with_pos_embed(key, key_pos_embed))[0]
+        # print("query2 : {}".format(query2.shape))
+
         query = query + self.dropout2(query2)
         query = self.norm2(query)
 
@@ -109,7 +310,6 @@ class TransformerDecoderLayer(nn.Module):
         # NxCxP to PxNxC
         query = query.permute(1, 2, 0)
         return query
-
 
 class MultiheadAttention(nn.Module):
     r"""Allows the model to jointly attend to information
@@ -135,8 +335,14 @@ class MultiheadAttention(nn.Module):
         >>> attn_output, attn_output_weights = multihead_attn(query, key, value)
     """
 
-    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None,
-                 vdim=None):
+    def __init__(self, embed_dim, 
+                       num_heads, 
+                       dropout=0., 
+                       bias=True, 
+                       add_bias_kv=False, 
+                       add_zero_attn=False, 
+                       kdim=None,
+                       vdim=None):
         super(MultiheadAttention, self).__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
@@ -147,8 +353,8 @@ class MultiheadAttention(nn.Module):
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
-
         self.in_proj_weight = Parameter(torch.empty(3 * embed_dim, embed_dim))
+
 
         if self._qkv_same_embed_dim is False:
             self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
@@ -491,6 +697,8 @@ def multi_head_attention_forward(query,  # type: Tensor
         return attn_output, attn_output_weights.sum(dim=1) / num_heads
     else:
         return attn_output, None
+
+
 
 
 class FFN(nn.Module):
